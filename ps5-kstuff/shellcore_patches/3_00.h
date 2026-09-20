@@ -57,4 +57,3 @@ static struct shellcore_patch shellcore_patches_300_devkit[] = {
 
 #endif // SHELLCORE_PATCHES_3_00
 
-

@@ -71,9 +71,20 @@ DEF(mov_rax_cr0, -0xaa3c61)
 DEF(syscall_cfi_table_jmp_int3, -0xA3CB08) //A3CFB0)
 
 DEF(cr0_load, -0x9EDA7C)
-DEF(cr0_clear_store, -0x5C2733)
-DEF(cr0_write_ret, -0x588353)
+DEF(cr0_clear_store, -0x5C2723)
+DEF(cr0_write_ret, -0x588343)
 DEF(store_rax_rdi, -0xAA3EEE)
+
+
+// PPR/fPKG offsets
+DEF(ppr_pfs_get_xts_index, -0x130290)
+DEF(ppr_pfs_get_cmac_index, -0x130130)
+DEF(ppr_pfs_get_xts_return, -0x92c9c7)
+DEF(ppr_pfs_get_cmac_return, -0x92c97c)
+DEF(ppr_pfs_cleanup_keys, -0x934e00)
+DEF(ppr_pfs_clear_key_missing, -0xa17eef)
+DEF(sceSblServiceMailbox_lr_verifyImage, -0xa1938d)
+DEF(ppr_pfs_verify_image_no_key_success, -0xa19032)
 
 // non data-relative offsets
 DEF(p_sysent, 0xA08)

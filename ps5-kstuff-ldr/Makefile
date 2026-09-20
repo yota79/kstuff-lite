@@ -45,7 +45,7 @@ all: kstuff.elf
 ../ps5-kstuff/payload.bin: .FORCE
 	$(MAKE) -C ../ps5-kstuff/
 
-kstuff.elf: ../ps5-kstuff/payload.bin $(SRC)
+kstuff.elf: ../ps5-kstuff/payload.bin $(SRC) include/shellcore_dynlib_abi.h ../lib/r0gdb-bootstrap.h ../lib/shellcore-imports.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LOADER_OPT) $(SRC) -o $@ $(LDFLAGS)
 
 clean:
@@ -53,4 +53,3 @@ clean:
 
 test: kstuff.elf
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
-

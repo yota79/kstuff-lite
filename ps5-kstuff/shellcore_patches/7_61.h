@@ -63,4 +63,3 @@ static struct shellcore_patch shellcore_patches_761_devkit[] = {
 
 
 
-

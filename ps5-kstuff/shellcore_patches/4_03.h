@@ -72,4 +72,3 @@ static struct shellcore_patch shellcore_patches_403_devkit[] = {
 };
 
 #endif // SHELLCORE_PATCHES_4_03
-

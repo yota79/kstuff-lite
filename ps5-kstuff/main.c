@@ -6,7 +6,6 @@
 #include <sys/syscall.h>
 #include <signal.h>
 #include <stdint.h>
-#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -16,6 +15,7 @@
 #include "../gdb_stub/dbg.h"
 #include "uelf/structs.h"
 #include "uelf/shared_area.h"
+#include "../lib/shellcore-imports.h"
 
 void* dlsym(void*, const char*);
 void* memcpy(void * __restrict, const void * __restrict, size_t);
@@ -248,13 +248,22 @@ void* load_kelf(void* ehdr, const char** symbols, uint64_t* values, void** base,
             uint64_t value = sym[1];
             if(!value)
             {
+                int found = 0;
                 for(size_t i = 0; symbols[i]; i++)
                     if(!strcmp(symbols[i], name))
+                    {
                         sym[1] = value = values[i];
+                        found = 1;
+                        break;
+                    }
                     else if(symbols[i][0] == '.' && !strcmp(symbols[i]+1, name))
+                    {
                         value = values[i];
+                        found = 1;
+                        break;
+                    }
 #ifndef FIRMWARE_PORTING
-                if(!value)
+                if(!found)
                     die();
 #endif
             }
@@ -330,7 +339,7 @@ uint64_t virt2phys(uintptr_t addr, uint64_t* phys_limit, uint64_t dmap, uint64_t
         inner_pml &= (1ull << 52) - (1ull << 12);
         pml = inner_pml;
     }
-    //unreachable
+    return UINT64_MAX;
 }
 
 static uint64_t virt2phys_or_die(uintptr_t addr, uint64_t* phys_limit, uint64_t dmap, uint64_t pml)
@@ -375,7 +384,9 @@ int get_proc_cr3(uint64_t pid, uint64_t* cr3, uint64_t* dmap_base)
      * into the offset table) if it is neither 0x2e0 nor 0x2e8.
      */
     uint32_t fwver = r0gdb_get_fw_version() >> 16;
-    uint32_t vmspace_pmap_offset = (fwver >= 0x600) ? 0x2E8 : 0x2E0;
+    uint32_t vmspace_pmap_offset = fwver <= 0x102 ? 0x2C0
+                                  : fwver >= 0x600 ? 0x2E8
+                                  : 0x2E0;
     uint64_t ptrs[2] = {0};
     copyout(ptrs, vmspace + vmspace_pmap_offset + 32, sizeof(ptrs));
     if (cr3) *cr3 = ptrs[1];
@@ -390,14 +401,39 @@ int phys_copyin(uint64_t vaddr, const void* src, uint64_t sz, uint64_t dmap, uin
     while(sz)
     {
         phys = virt2phys(vaddr, &phys_end, dmap, pml);
-        if(phys == -1)
+        if(phys == UINT64_MAX)
             return -1;
         size_t chk = phys_end - phys;
         if(sz < chk)
             chk = sz;
-        copyin(dmap+phys, p_src, chk);
+        ssize_t copied = copyin(dmap + phys, p_src, chk);
+        if(copied < 0 || (size_t)copied != chk)
+            return -1;
         vaddr += chk;
         p_src += chk;
+        sz -= chk;
+    }
+    return 0;
+}
+
+static int phys_copyout(void* dst, uint64_t vaddr, uint64_t sz,
+                        uint64_t dmap, uint64_t pml)
+{
+    char* p_dst = dst;
+    uint64_t phys, phys_end;
+    while(sz)
+    {
+        phys = virt2phys(vaddr, &phys_end, dmap, pml);
+        if(phys == UINT64_MAX)
+            return -1;
+        size_t chk = phys_end - phys;
+        if(sz < chk)
+            chk = sz;
+        ssize_t copied = copyout(p_dst, dmap + phys, chk);
+        if(copied < 0 || (size_t)copied != chk)
+            return -1;
+        vaddr += chk;
+        p_dst += chk;
         sz -= chk;
     }
     return 0;
@@ -412,9 +448,46 @@ uint64_t find_empty_pml4_index(int idx)
     for(int i = 256; i < 512; i++)
         if(!pml4[i] && !idx--)
             return i;
+    return UINT64_MAX;
 }
 
-void build_uelf_cr3(uint64_t uelf_cr3, void* uelf_base[2], uint64_t uelf_virt_base, uint64_t dmap_virt_base, uint64_t dmap, uint64_t cr3)
+enum { UELF_SHARED_AREA_OFFSET = 0x1f0000 };
+
+/*
+ * shared_area grew beyond one page when PPR staging was added. Kernel malloc
+ * provides contiguous virtual space, not necessarily contiguous physical
+ * pages, so translating only its first byte and adding offsets can corrupt an
+ * unrelated page. Map every backing page explicitly into each uelf CR3.
+ */
+static void build_uelf_shared_area_mapping(uint64_t pml1_virt,
+                                           uint64_t kernel_address,
+                                           uint64_t user_address,
+                                           uint64_t uelf_virt_base,
+                                           uint64_t dmap,
+                                           uint64_t cr3)
+{
+    if((kernel_address & 4095) || (user_address & 4095)
+    || (SHARED_AREA_SIZE & 4095)
+    || user_address < uelf_virt_base
+    || user_address + SHARED_AREA_SIZE < user_address
+    || user_address + SHARED_AREA_SIZE > uelf_virt_base + 0x200000)
+        die();
+
+    uint64_t pte = (user_address - uelf_virt_base) >> 12;
+    for(uint64_t offset = 0; offset < SHARED_AREA_SIZE; offset += 4096)
+    {
+        uint64_t phys = virt2phys_or_die(kernel_address + offset, 0,
+                                        dmap, cr3);
+        copyin(pml1_virt + 8 * (pte + offset / 4096),
+               &(uint64_t[1]){phys | 7}, 8);
+    }
+}
+
+void build_uelf_cr3(uint64_t uelf_cr3, void* uelf_base[2],
+                    uint64_t uelf_virt_base, uint64_t dmap_virt_base,
+                    uint64_t shared_area_kernel,
+                    uint64_t shared_area_user,
+                    uint64_t dmap, uint64_t cr3)
 {
     enum
     {
@@ -428,7 +501,9 @@ void build_uelf_cr3(uint64_t uelf_cr3, void* uelf_base[2], uint64_t uelf_virt_ba
     static char zeros[4096];
     uint64_t user_start = (uint64_t)uelf_base[0];
     uint64_t user_end = (uint64_t)uelf_base[1];
-    if((uelf_virt_base & 0x1fffff) || (dmap_virt_base & ((1ull << 39) - 1)) || user_end - user_start > 0x200000)
+    if((uelf_virt_base & 0x1fffff)
+    || (dmap_virt_base & ((1ull << 39) - 1))
+    || user_end - user_start > UELF_SHARED_AREA_OFFSET)
         die();
     uint64_t pml4_virt = uelf_cr3;
     copyin(pml4_virt, zeros, 4096);
@@ -445,6 +520,9 @@ void build_uelf_cr3(uint64_t uelf_cr3, void* uelf_base[2], uint64_t uelf_virt_ba
     copyin(pml2_virt + 8 * ((uelf_virt_base >> 21) & 511), &(uint64_t[1]){virt2phys_or_die(pml1_virt, 0, dmap, cr3) | user_page}, 8);
     copyin(pml1_virt, zeros, 4096);
     build_uelf_pml1(pml1_virt, user_start, user_end, dmap, cr3);
+    build_uelf_shared_area_mapping(pml1_virt, shared_area_kernel,
+                                   shared_area_user, uelf_virt_base,
+                                   dmap, cr3);
     for(uint64_t i = 0; i < 512; i++)
         copyin(pml3_dmap+8*i, &(uint64_t[1]){(i<<30) | user_large_page}, 8);
 }
@@ -466,14 +544,12 @@ int find_proc(const char* name)
     return -1;
 }
 
-static uint64_t remote_syscall(int pid, int nr, ...)
+static uint64_t remote_syscall(int pid, int nr,
+                               uint64_t arg0, uint64_t arg1,
+                               uint64_t arg2, uint64_t arg3,
+                               uint64_t arg4, uint64_t arg5)
 {
-    va_list va;
-    va_start(va, nr);
-    uint64_t args[6];
-    for(int i = 0; i < 6; i++)
-        args[i] = va_arg(va, uint64_t);
-    va_end(va);
+    uint64_t args[6] = {arg0, arg1, arg2, arg3, arg4, arg5};
     return kekcall(pid, nr, (uint64_t)args, 0, 0, 0, KEKCALL_REMOTE_SYSCALL);
 }
 
@@ -529,7 +605,18 @@ struct shellcore_patch
  * to the module image; verify original bytes and the retail/testkit/devkit
  * variants before enabling the firmware.
  */
+#include "shellcore_patches/1_00.h"
+#include "shellcore_patches/1_01.h"
+#include "shellcore_patches/1_02.h"
+#include "shellcore_patches/1_12.h"
+#include "shellcore_patches/1_14.h"
+#include "shellcore_patches/2_00.h"
+#include "shellcore_patches/2_20.h"
+#include "shellcore_patches/2_25.h"
+#include "shellcore_patches/2_26.h"
+#include "shellcore_patches/2_30.h"
 #include "shellcore_patches/2_50.h"
+#include "shellcore_patches/2_70.h"
 #include "shellcore_patches/3_00.h"
 #include "shellcore_patches/3_10.h"
 #include "shellcore_patches/3_20.h"
@@ -576,6 +663,11 @@ struct shellcore_patch
 #include "shellcore_patches/12_40.h"
 #include "shellcore_patches/12_60.h"
 #include "shellcore_patches/12_70.h"
+#include "shellcore_patches/13_00.h"
+#include "shellcore_patches/13_20.h"
+#include "shellcore_patches/13_40.h"
+#include "shellcore_patches/13_42.h"
+#include "shellcore_patches/13_60.h"
 
 extern char _start[];
 
@@ -652,6 +744,402 @@ static enum kit_type get_kit_type(void) {
     return KIT_RETAIL;
 }
 
+extern const unsigned char ppr_mount_940_blob_start[];
+extern const unsigned char ppr_mount_940_blob_end[];
+
+#define SHELLCORE_PPR_SYSCALL_PLACEHOLDER 0x4C43535953525050ull
+#define SHELLCORE_PPR_CLOSE_PLACEHOLDER   0x3145534F4C435250ull
+#define SHELLCORE_PPR_OPEN_PLACEHOLDER    0x314E45504F525050ull
+#define SHELLCORE_PPR_PREAD_PLACEHOLDER   0x3144414552525050ull
+#define SHELLCORE_PPR_MOUNT_PLACEHOLDER   0x31544E554D525050ull
+#define SHELLCORE_GAME_MOUNT_PLACEHOLDER  0x31544E554D454D47ull
+#define SHELLCORE_GAME_UMOUNT_PLACEHOLDER 0x31544D55454D4147ull
+#define SHELLCORE_PPR_UMOUNT_PLACEHOLDER  0x31544D5552505050ull
+#define SHELLCORE_GAME_MOUNT_MARKER       0x314D47454B504746ull
+#define SHELLCORE_GAME_UMOUNT_MARKER      0x315547454B504746ull
+#define SHELLCORE_PPR_UMOUNT_MARKER       0x315550504B504746ull
+#define SHELLCORE_FPKG_WRAPPER_MAP_SIZE   0x4000
+#define SHELLCORE_LOCKED_PAGE_CAP         128
+
+static const char* shellcore_patch_failure;
+
+static int shellcore_ppr_fail(const char* reason)
+{
+    shellcore_patch_failure = reason;
+    return -1;
+}
+
+struct shellcore_locked_pages
+{
+    uint64_t pages[SHELLCORE_LOCKED_PAGE_CAP];
+    size_t count;
+};
+
+static int lock_shellcore_range(int pid, uint64_t address, uint64_t size,
+                                struct shellcore_locked_pages* locked)
+{
+    if(!size || address + size - 1 < address)
+        return -1;
+    const uint64_t page_mask = SHELLCORE_FPKG_WRAPPER_MAP_SIZE - 1;
+    uint64_t page = address & ~page_mask;
+    uint64_t last = (address + size - 1) & ~page_mask;
+    for(;; page += SHELLCORE_FPKG_WRAPPER_MAP_SIZE)
+    {
+        size_t i = 0;
+        while(i < locked->count && locked->pages[i] != page)
+            i++;
+        if(i == locked->count)
+        {
+            if(locked->count == SHELLCORE_LOCKED_PAGE_CAP
+            || remote_syscall(pid, SYS_mlock, page,
+                              SHELLCORE_FPKG_WRAPPER_MAP_SIZE,
+                              0, 0, 0, 0))
+                return -1;
+            locked->pages[locked->count++] = page;
+        }
+        if(page == last)
+            break;
+    }
+    return 0;
+}
+
+static int replace_shellcore_blob_u64(unsigned char* blob, size_t blob_size,
+                                      uint64_t placeholder, uint64_t value,
+                                      size_t expected_count)
+{
+    size_t count = 0;
+    for(size_t offset = 0; offset + sizeof(uint64_t) <= blob_size; offset++)
+    {
+        uint64_t current;
+        memcpy(&current, blob + offset, sizeof(current));
+        if(current != placeholder)
+            continue;
+        memcpy(blob + offset, &value, sizeof(value));
+        count++;
+    }
+    return count == expected_count ? 0 : -1;
+}
+
+static int shellcore_bytes_equal(const unsigned char* lhs,
+                                 const unsigned char* rhs, size_t size)
+{
+    for(size_t i = 0; i < size; i++)
+        if(lhs[i] != rhs[i])
+            return 0;
+    return 1;
+}
+
+static int verify_shellcore_blob(uint64_t address, const unsigned char* blob,
+                                 size_t size, uint64_t dmap, uint64_t cr3)
+{
+    unsigned char readback[0x400];
+    for(size_t offset = 0; offset < size; offset += sizeof(readback))
+    {
+        size_t length = size - offset;
+        if(length > sizeof(readback))
+            length = sizeof(readback);
+        if(phys_copyout(readback, address + offset, length, dmap, cr3)
+        || !shellcore_bytes_equal(readback, blob + offset, length))
+            return -1;
+    }
+    return 0;
+}
+
+extern intptr_t (*kstuff_dynlib_resolve)(int pid, uint32_t handle,
+                                         const char* nid);
+extern int (*kstuff_dynlib_handle)(int pid, const char* name,
+                                   uint32_t* handle);
+extern kstuff_shellcore_imports_fn kstuff_shellcore_imports;
+
+static const unsigned char shellcore_getpid_stub[] = {
+    0x48, 0xc7, 0xc0, 0x14, 0x00, 0x00, 0x00, /* mov eax, SYS_getpid */
+    0x49, 0x89, 0xca,                         /* mov r10, rcx */
+    0x0f, 0x05,                               /* syscall */
+    0x72, 0x01, 0xc3                          /* jc error; ret */
+};
+
+static int find_shellcore_blob_entry(const unsigned char* blob,
+                                     size_t blob_size, uint64_t marker,
+                                     size_t* entry_offset)
+{
+    size_t count = 0;
+    for(size_t offset = 0; offset + sizeof(marker) <= blob_size; offset++)
+    {
+        uint64_t current;
+        memcpy(&current, blob + offset, sizeof(current));
+        if(current != marker)
+            continue;
+        *entry_offset = offset + sizeof(marker);
+        count++;
+    }
+    return count == 1 && *entry_offset < blob_size ? 0 : -1;
+}
+
+static int read_shellcore_import(int pid, uint64_t shellcore_base,
+                                 uint64_t text_end, uint64_t got,
+                                 uint64_t dmap, uint64_t cr3,
+                                 struct shellcore_locked_pages* locked,
+                                 uint64_t* target, uint64_t* lazy_plt)
+{
+    if(!got || lock_shellcore_range(pid, got, sizeof(*target), locked)
+    || phys_copyout(target, got, sizeof(*target), dmap, cr3)
+    || *target < 0x10000 || *target >= 0x0000800000000000ull)
+        return -1;
+    *lazy_plt = 0;
+    if(*target >= shellcore_base + 6 && *target < text_end)
+    {
+        unsigned char plt[6];
+        uint64_t plt_addr = *target - sizeof(plt);
+        if(lock_shellcore_range(pid, plt_addr, sizeof(plt), locked)
+        || phys_copyout(plt, plt_addr, sizeof(plt), dmap, cr3)
+        || plt[0] != 0xff || plt[1] != 0x25)
+            return -1;
+        int32_t displacement;
+        memcpy(&displacement, plt + 2, sizeof(displacement));
+        if(*target + displacement != got)
+            return -1;
+        *lazy_plt = plt_addr;
+    }
+    return 0;
+}
+
+static int resolve_shellcore_syscall_trampoline(
+    int pid, uint64_t dmap, uint64_t cr3,
+    struct shellcore_locked_pages* locked, uint64_t* target)
+{
+    static const uint32_t libkernel_handles[] = {1, 0x2001};
+    for(size_t i = 0; i < sizeof(libkernel_handles)
+                           / sizeof(libkernel_handles[0]); i++)
+    {
+        uint64_t address = kstuff_dynlib_resolve(
+            pid, libkernel_handles[i], "HoLVWNanBBc"); /* getpid */
+        if(address < 0x10000
+        || address >= 0x0000800000000000ull
+                      - sizeof(shellcore_getpid_stub))
+            continue;
+        unsigned char code[sizeof(shellcore_getpid_stub)];
+        if(phys_copyout(code, address, sizeof(code), dmap, cr3)
+        && (lock_shellcore_range(pid, address, sizeof(code), locked)
+            || phys_copyout(code, address, sizeof(code), dmap, cr3)))
+            continue;
+        if(shellcore_bytes_equal(code, shellcore_getpid_stub,
+                                 sizeof(code)))
+        {
+            *target = address + 7;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int install_shellcore_ppr_hook(
+    int pid, uint64_t shellcore_base, uint64_t text_end,
+    uint64_t dmap, uint64_t cr3,
+    struct shellcore_locked_pages* locked)
+{
+    const size_t blob_size = (size_t)(ppr_mount_940_blob_end
+                                    - ppr_mount_940_blob_start);
+    static unsigned char prepared_blob[SHELLCORE_FPKG_WRAPPER_MAP_SIZE];
+    uint64_t helper_target[3] = {0};
+    uint64_t api_got[4] = {0}, api_target[4] = {0};
+    uint64_t import_got[SHELLCORE_IMPORT_COUNT];
+    uint64_t api_original_got[4] = {0};
+    uint64_t api_wrapper[4];
+    uint32_t fs_handle = 0;
+    int have_fs_handle = 0;
+    size_t game_mount_entry = 0;
+    size_t game_umount_entry = 0;
+    size_t ppr_umount_entry = 0;
+
+    const size_t api_count = sizeof(api_got) / sizeof(api_got[0]);
+    if(!blob_size || blob_size > sizeof(prepared_blob))
+        return shellcore_ppr_fail("fpkg scope: invalid wrapper blob size");
+
+    uint32_t required_mask = SHELLCORE_IMPORT_BIT(SHELLCORE_IMPORT_MOUNT_GAME)
+                           | SHELLCORE_IMPORT_BIT(SHELLCORE_IMPORT_UMOUNT_GAME)
+                           | SHELLCORE_IMPORT_BIT(SHELLCORE_IMPORT_CLOSE)
+                           | SHELLCORE_IMPORT_BIT(SHELLCORE_IMPORT_OPEN)
+                           | SHELLCORE_IMPORT_BIT(SHELLCORE_IMPORT_PREAD)
+                           | SHELLCORE_IMPORT_BIT(SHELLCORE_IMPORT_MOUNT_PPR)
+                           | SHELLCORE_IMPORT_BIT(SHELLCORE_IMPORT_UMOUNT_PPR);
+    if(kstuff_shellcore_imports(pid, shellcore_base, required_mask,
+                                import_got))
+        return shellcore_ppr_fail("fpkg scope: ShellCore imports unavailable");
+    for(size_t i = 0; i < 3; i++)
+    {
+        uint64_t lazy_plt;
+        if(read_shellcore_import(pid, shellcore_base, text_end, import_got[i],
+                                 dmap, cr3, locked, &helper_target[i],
+                                 &lazy_plt))
+            return shellcore_ppr_fail("fpkg scope: helper import mismatch");
+        if(lazy_plt)
+            helper_target[i] = lazy_plt;
+    }
+    for(size_t i = 0; i < api_count; i++)
+    {
+        api_got[i] = import_got[SHELLCORE_IMPORT_MOUNT_GAME + i];
+        uint64_t lazy_plt;
+        if(read_shellcore_import(pid, shellcore_base, text_end, api_got[i],
+                                 dmap, cr3, locked, &api_target[i],
+                                 &lazy_plt))
+            return shellcore_ppr_fail(
+                "fpkg scope: package API import mismatch");
+        if(api_got[i] & (sizeof(api_got[i]) - 1))
+            return shellcore_ppr_fail("fpkg scope: unaligned API GOT slot");
+        for(size_t previous = 0; previous < i; previous++)
+            if(api_got[previous] == api_got[i])
+                return shellcore_ppr_fail("fpkg scope: duplicate API GOT slot");
+        api_original_got[i] = api_target[i];
+        if(lazy_plt)
+        {
+            if(!have_fs_handle)
+            {
+                if(kstuff_dynlib_handle(pid, "libSceFsInternalForVsh.prx",
+                                         &fs_handle))
+                    return shellcore_ppr_fail(
+                        "fpkg scope: package API module unavailable");
+                have_fs_handle = 1;
+            }
+            uint64_t address = kstuff_dynlib_resolve(pid, fs_handle,
+                shellcore_import_nids[SHELLCORE_IMPORT_MOUNT_GAME + i]);
+            if(address < 0x10000 || address >= 0x0000800000000000ull)
+                return shellcore_ppr_fail(
+                    "fpkg scope: package API export unavailable");
+            api_target[i] = address;
+        }
+    }
+
+    /* A validated libkernel syscall instruction is required; getpid@GOT may
+     * still be lazy on any supported firmware. */
+    uint64_t syscall_target;
+    if(resolve_shellcore_syscall_trampoline(pid, dmap, cr3, locked,
+                                            &syscall_target))
+        return shellcore_ppr_fail(
+            "fpkg scope: libkernel syscall trampoline unavailable");
+
+    memcpy(prepared_blob, ppr_mount_940_blob_start, blob_size);
+    if(replace_shellcore_blob_u64(prepared_blob, blob_size,
+                                  SHELLCORE_PPR_SYSCALL_PLACEHOLDER,
+                                  syscall_target, 1)
+    || replace_shellcore_blob_u64(prepared_blob, blob_size,
+                                  SHELLCORE_PPR_CLOSE_PLACEHOLDER,
+                                  helper_target[0], 2)
+    || replace_shellcore_blob_u64(prepared_blob, blob_size,
+                                  SHELLCORE_PPR_OPEN_PLACEHOLDER,
+                                  helper_target[1], 1)
+    || replace_shellcore_blob_u64(prepared_blob, blob_size,
+                                  SHELLCORE_PPR_PREAD_PLACEHOLDER,
+                                  helper_target[2], 1)
+    || replace_shellcore_blob_u64(prepared_blob, blob_size,
+                                  SHELLCORE_PPR_MOUNT_PLACEHOLDER,
+                                  api_target[2], 1)
+    || replace_shellcore_blob_u64(prepared_blob, blob_size,
+                                  SHELLCORE_GAME_MOUNT_PLACEHOLDER,
+                                  api_target[0], 1)
+    || replace_shellcore_blob_u64(prepared_blob, blob_size,
+                                  SHELLCORE_GAME_UMOUNT_PLACEHOLDER,
+                                  api_target[1], 1)
+    || replace_shellcore_blob_u64(prepared_blob, blob_size,
+                                  SHELLCORE_PPR_UMOUNT_PLACEHOLDER,
+                                  api_target[3], 1)
+    || find_shellcore_blob_entry(prepared_blob, blob_size,
+                                 SHELLCORE_GAME_MOUNT_MARKER,
+                                 &game_mount_entry)
+    || find_shellcore_blob_entry(prepared_blob, blob_size,
+                                 SHELLCORE_GAME_UMOUNT_MARKER,
+                                 &game_umount_entry)
+    || find_shellcore_blob_entry(prepared_blob, blob_size,
+                                 SHELLCORE_PPR_UMOUNT_MARKER,
+                                 &ppr_umount_entry))
+        return shellcore_ppr_fail("fpkg scope: wrapper placeholders mismatch");
+
+    uint64_t wrapper_base = remote_syscall(
+        pid, SYS_mmap, 0, SHELLCORE_FPKG_WRAPPER_MAP_SIZE,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+        (uint64_t)-1, 0);
+    if(wrapper_base < 0x10000 || wrapper_base >= 0x0000800000000000ull)
+        return shellcore_ppr_fail("fpkg scope: wrapper mmap failed");
+    if(remote_syscall(pid, SYS_mlock, wrapper_base,
+                      SHELLCORE_FPKG_WRAPPER_MAP_SIZE, 0, 0, 0, 0))
+    {
+        remote_syscall(pid, SYS_munmap, wrapper_base,
+                       SHELLCORE_FPKG_WRAPPER_MAP_SIZE, 0, 0, 0, 0);
+        return shellcore_ppr_fail("fpkg scope: wrapper mlock failed");
+    }
+    if(phys_copyin(wrapper_base, prepared_blob, blob_size, dmap, cr3)
+    || verify_shellcore_blob(wrapper_base, prepared_blob, blob_size,
+                             dmap, cr3))
+    {
+        remote_syscall(pid, SYS_munmap, wrapper_base,
+                       SHELLCORE_FPKG_WRAPPER_MAP_SIZE, 0, 0, 0, 0);
+        return shellcore_ppr_fail("fpkg scope: wrapper write verification failed");
+    }
+    if(remote_syscall(pid, SYS_mprotect, wrapper_base,
+                      SHELLCORE_FPKG_WRAPPER_MAP_SIZE,
+                      PROT_READ | PROT_EXEC, 0, 0, 0))
+    {
+        remote_syscall(pid, SYS_munmap, wrapper_base,
+                       SHELLCORE_FPKG_WRAPPER_MAP_SIZE, 0, 0, 0, 0);
+        return shellcore_ppr_fail("fpkg scope: wrapper mprotect failed");
+    }
+
+    api_wrapper[0] = wrapper_base + game_mount_entry;
+    api_wrapper[1] = wrapper_base + game_umount_entry;
+    api_wrapper[2] = wrapper_base;
+    api_wrapper[3] = wrapper_base + ppr_umount_entry;
+    size_t installed = 0;
+    size_t touched = 0;
+    for(; installed < api_count; installed++)
+    {
+        uint64_t current;
+        if(phys_copyout(&current, api_got[installed], sizeof(current),
+                        dmap, cr3)
+        || current != api_original_got[installed])
+            break;
+        touched = installed + 1;
+        if(phys_copyin(api_got[installed], &api_wrapper[installed],
+                       sizeof(api_wrapper[installed]), dmap, cr3))
+            break;
+        if(phys_copyout(&current, api_got[installed], sizeof(current),
+                        dmap, cr3)
+        || current != api_wrapper[installed])
+            break;
+    }
+    if(installed == api_count)
+        for(size_t i = 0; i < api_count; i++)
+        {
+            uint64_t current;
+            if(phys_copyout(&current, api_got[i], sizeof(current), dmap, cr3)
+            || current != api_wrapper[i])
+            {
+                installed = i;
+                break;
+            }
+        }
+    if(installed != api_count)
+    {
+        int rollback_failed = 0;
+        for(size_t i = 0; i < touched; i++)
+        {
+            uint64_t current = 0;
+            if(phys_copyin(api_got[i], &api_original_got[i],
+                           sizeof(api_original_got[i]), dmap, cr3)
+            || phys_copyout(&current, api_got[i], sizeof(current), dmap, cr3)
+            || current != api_original_got[i])
+                rollback_failed = 1;
+        }
+        /* A thread may already be executing a wrapper even after its GOT
+         * entry is restored. Keep the mapping once any entry was touched. */
+        if(!touched && !rollback_failed)
+            remote_syscall(pid, SYS_munmap, wrapper_base,
+                           SHELLCORE_FPKG_WRAPPER_MAP_SIZE, 0, 0, 0, 0);
+        return shellcore_ppr_fail(
+            rollback_failed ? "fpkg scope: API GOT rollback failed"
+                            : "fpkg scope: API GOT install failed");
+    }
+    return 0;
+}
+
 static const struct shellcore_patch* get_shellcore_patches(size_t* n_patches)
 {
 enum kit_type kit = get_kit_type();
@@ -679,7 +1167,18 @@ enum kit_type kit = get_kit_type();
     switch(ver)
     {
     /* TODO(FW_PORT): add FW(<version>) after including its verified table. */
+    FW(100);
+    FW(101);
+    FW(102);
+    FW(112);
+    FW(114);
+    FW(200);
+    FW(220);
+    FW(225);
+    FW(226);
+    FW(230);
     FW(250);
+    FW(270);
     FW(300);
     FW(310);
     FW(320);
@@ -726,6 +1225,11 @@ enum kit_type kit = get_kit_type();
     FW(1240);
     FW(1260);
     FW(1270);
+    FW(1300);
+    FW(1320);
+    FW(1340);
+    FW(1342);
+    FW(1360);
 
     default:
         *n_patches = 1;
@@ -738,24 +1242,48 @@ enum kit_type kit = get_kit_type();
 
 static int patch_shellcore(const struct shellcore_patch* patches, size_t n_patches, uint64_t eh_frame_offset)
 {
+    shellcore_patch_failure = 0;
+    int install_fpkg_hook = get_kit_type() == KIT_RETAIL && patches;
+    if(install_fpkg_hook && (!kstuff_dynlib_handle || !kstuff_dynlib_resolve
+                         || !kstuff_shellcore_imports))
+        return shellcore_ppr_fail("fpkg scope: SDK resolver unavailable");
     int pid = find_proc("SceShellCore");
+    if(pid <= 0)
+        return -1;
     struct module_info_ex mod_info;
     mod_info.st_size = sizeof(mod_info);
-    if (remote_syscall(pid, SYS_dynlib_get_info_ex, 0, 0, &mod_info))
+    if (remote_syscall(pid, SYS_dynlib_get_info_ex, 0, 0,
+                       (uint64_t)&mod_info, 0, 0, 0))
         return -1;
     uint64_t shellcore_base = mod_info.eh_frame_hdr_addr - eh_frame_offset;
-    uint64_t textsize = mod_info.segments[0].size;
-    if (remote_syscall(pid, SYS_mlock, shellcore_base, textsize))
-        return -1;
+    if(install_fpkg_hook && (shellcore_base < 0x10000
+    || shellcore_base >= 0x0000800000000000ull
+    || !mod_info.segment_count
+    || mod_info.segments[0].addr != shellcore_base
+    || mod_info.segments[0].size < 6
+    || mod_info.segments[0].size >= 0x0000800000000000ull
+                                  - shellcore_base))
+        return shellcore_ppr_fail("fpkg scope: invalid ShellCore text segment");
+    uint64_t text_end = mod_info.segments[0].addr
+                      + mod_info.segments[0].size;
     uint64_t cr3, dmap;
     if(get_proc_cr3(pid, &cr3, &dmap))
         return -1;
 
-    for(int i = 0; i < n_patches; i++)
+    struct shellcore_locked_pages locked = {0};
+
+    for(size_t i = 0; i < n_patches; i++)
     {
+        if(lock_shellcore_range(pid, shellcore_base + patches[i].offset,
+                                patches[i].sz, &locked))
+            return -1;
         if(phys_copyin(shellcore_base + patches[i].offset, patches[i].data, patches[i].sz, dmap, cr3))
             return -1;
     }
+    if(install_fpkg_hook
+    && install_shellcore_ppr_hook(pid, shellcore_base, text_end,
+                                  dmap, cr3, &locked))
+        return -1;
     return 0;
 }
 
@@ -844,12 +1372,18 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
 #endif
     gdb_remote_syscall("write", 3, 0, (uintptr_t)1, (uintptr_t)"allocating kernel memory... ", (uintptr_t)28);
 
+    uint64_t fwver = r0gdb_get_fw_version() >> 16;
+
 #ifdef USE_INT3_SYSCALL_HOOK
+    int is_kit = sceKernelIsTestKit() || sceKernelIsDevKit();
     // this jmp to int3 exists because sony fills certain functions with int3 depending on the console type
     // retails have the most of these redacted functions, testkits less, devkits even less, presumably "DevKit Intdev" has none
     // the built in offsets are mostly from retail firmwares so for kits we need to find them again
-    int is_kit = sceKernelIsTestKit() || sceKernelIsDevKit();
     if (offsets.syscall_cfi_table_jmp_int3 == kdata_base || is_kit) {
+        // kcfi was added at fw 2.00, `r0gdb_find_syscall_cfi_table_jmp_int3_addr` wouldnt work on 1.xx so bail
+        // NOTE: since there is no cfi check, on 1.xx `syscall_cfi_table_jmp_int3` can/should point to any 0xCC byte in kernel .text
+        if (fwver < 0x200)
+            die();
         offsets.syscall_cfi_table_jmp_int3 = r0gdb_find_syscall_cfi_table_jmp_int3_addr();
         if (offsets.syscall_cfi_table_jmp_int3 == 0 || offsets.syscall_cfi_table_jmp_int3 == kdata_base)
             die();
@@ -879,17 +1413,17 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
     //trying to copyin the whole 64k at once hangs here for some reason
     for(size_t i = 0; i < 256; i++)
         copyin(comparison_table+256*i, comparison_table_data+256*i, 256);
-    uint64_t shared_area;
+    uint64_t shared_area_kernel;
     if(comparison_table - comparison_table_base > SHARED_AREA_SIZE)
-        shared_area = comparison_table - SHARED_AREA_SIZE;
+        shared_area_kernel = comparison_table - SHARED_AREA_SIZE;
     else
-        shared_area = comparison_table + 65536;
-    kmemzero((void*)shared_area, SHARED_AREA_SIZE);
+        shared_area_kernel = comparison_table + 65536;
+    kmemzero((void*)shared_area_kernel, SHARED_AREA_SIZE);
     uint64_t kernel_dmap = get_dmap_base();
     uint64_t kernel_cr3 = r0gdb_read_cr3();
     uint64_t uelf_virt_base = (find_empty_pml4_index(0) << 39) | (-1ull << 48);
     uint64_t dmem_virt_base = (find_empty_pml4_index(1) << 39) | (-1ull << 48);
-    shared_area = virt2phys_or_die(shared_area, 0, kernel_dmap, kernel_cr3) + dmem_virt_base;
+    uint64_t shared_area_user = uelf_virt_base + UELF_SHARED_AREA_OFFSET;
 
     volatile int zero = 0; //hack to force runtime calculation of string pointers
     const char* symbols[] = {
@@ -909,13 +1443,14 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         ".fwver"+zero,
 #define KDATA_OFFSET(x) (#x)+zero,
 #define ABSOLUTE_OFFSET(x) (#x)+zero,
+#define OPTIONAL_KDATA_OFFSET(x) (#x)+zero,
 #include "../prosper0gdb/offsets/offset_list.txt"
 #undef KDATA_OFFSET
 #undef ABSOLUTE_OFFSET
+#undef OPTIONAL_KDATA_OFFSET
         0,
     };
 	
-    uint64_t fwver = r0gdb_get_fw_version() >> 16;
     uint64_t values[] = {
         comparison_table,      // comparison_table
         dmem_virt_base,        // dmem
@@ -926,16 +1461,18 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         0x1238,                // .ist_noerrc
         0x1239,                // .ist4
         0x1234,                // .pcpu
-        shared_area,           // shared_area
+        shared_area_user,      // shared_area
         0x123a,                // .tss
         0x1235,                // .uelf_cr3
         0x1236,                // .uelf_entry
         fwver,                 // .fwver
 #define KDATA_OFFSET(x) offsets.x,
 #define ABSOLUTE_OFFSET(x) offsets.x,
+#define OPTIONAL_KDATA_OFFSET(x) offsets.x,
 #include "../prosper0gdb/offsets/offset_list.txt"
 #undef KDATA_OFFSET
 #undef ABSOLUTE_OFFSET
+#undef OPTIONAL_KDATA_OFFSET
         0,
     };
     size_t pcpu_idx, uelf_cr3_idx, uelf_entry_idx, ist_errc_idx, ist_noerrc_idx, ist4_idx, tss_idx;
@@ -987,7 +1524,9 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         void* entry = 0;
         void* base[2] = {0};
         char* kelf = load_kelf(kek, symbols, values, base, &entry, 0);
-        build_uelf_cr3(uelf_cr3, uelf_base, uelf_virt_base, dmem_virt_base, kernel_dmap, kernel_cr3);
+        build_uelf_cr3(uelf_cr3, uelf_base, uelf_virt_base, dmem_virt_base,
+                       shared_area_kernel, shared_area_user,
+                       kernel_dmap, kernel_cr3);
         uelf_bases[cpu] = (uintptr_t)uelf;
         kelf_bases[cpu] = (uint64_t)kelf;
         kelf_entries[cpu] = (uint64_t)entry;
@@ -1046,17 +1585,19 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
         SYS_get_sdk_compiled_version,
         SYS_get_ppr_sdk_compiled_version,
         SYS_getppid,
-        SYS_nmount,
-        SYS_unmount,
         SYS_mprotect,
         SYS_mdbg_call
     };
     static const int num_syscalls_to_hook_for_ps5 = sizeof(syscalls_to_hook_for_ps5) / sizeof(syscalls_to_hook_for_ps5[0]);
 
-    // ioctl is only used for the npdrm hook, which is only used by shellcore, avoid the overhead of hooking every ioctl for every proc
+    // Package mount interception is scoped to ShellCore. The four public
+    // sceFs*GamePkg/sceFs*PprPkg wrappers further gate the individual calls.
+    // ioctl is likewise only used by ShellCore's npdrm hook.
     // TODO: handle npdrm hook in userland?
     static const int extra_syscalls_to_hook_for_shellcore[] = {
-        SYS_ioctl
+        SYS_ioctl,
+        SYS_nmount,
+        SYS_unmount
     };
     static const int num_extra_syscalls_to_hook_for_shellcore = sizeof(extra_syscalls_to_hook_for_shellcore) / sizeof(extra_syscalls_to_hook_for_shellcore[0]);
 
@@ -1151,7 +1692,8 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
                             n_shellcore_patches,
                             shellcore_eh_frame_offset))
         {
-            notify("failed to patch shellcore");
+            notify(shellcore_patch_failure ? shellcore_patch_failure
+                                           : "failed to patch shellcore");
         }
     }
 
@@ -1163,7 +1705,7 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
                                "Retail";
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "Welcome To Kstuff Lite 1.11-test5-dr\nPlayStation 5 FW: %x.%02x (%s)\nBy sleirsgoevy",
+    snprintf(msg, sizeof(msg), "Welcome To Kstuff Lite 1.11\nPlayStation 5 FW: %x.%02x (%s)\nBy sleirsgoevy",
              fwver >> 8, fwver & 0xFF, console_type);
     notify(msg);
 	

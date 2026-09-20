@@ -48,6 +48,8 @@ along with this program; see the file COPYING. If not, see
 #include "mount_helpers.h"
 #include "shellui_patch.h"
 #include "utils.h"
+#include "../../lib/r0gdb-bootstrap.h"
+#include "../../lib/shellcore-imports.h"
 
 asm(".section .rodata\n"
     ".global ___ps5_kstuff_payload_bin\n"
@@ -55,6 +57,8 @@ asm(".section .rodata\n"
     ".incbin \"../../ps5-kstuff/payload.bin\"\n");
 
 extern char ___ps5_kstuff_payload_bin[];
+int shellcore_import_got(int pid, uint64_t image_base, uint32_t required_mask,
+                         uint64_t got[SHELLCORE_IMPORT_COUNT]);
 
 int patch_app_db(void);
 int sceKernelSetProcessName(const char *name);
@@ -75,10 +79,29 @@ static int automount_disabled(void) {
     return access("/data/.kstuff_noautomount", F_OK) == 0;
 }
 
-static int mount_source(const char* src_path, char* out_mounted_path)
+static int mount_source(const char* src_path, char* out_mounted_path,
+                        bool* out_temporary_mount)
 {
+    struct stat source_st;
     char image_path[MAX_PATH] = {0};
     bool is_ufs = false, is_pfs = false, is_pfsc = false, is_exfat = false;
+
+    if (!src_path || !*src_path || !out_mounted_path ||
+        !out_temporary_mount) {
+        errno = EINVAL;
+        return -1;
+    }
+    out_mounted_path[0] = '\0';
+    *out_temporary_mount = false;
+
+    /* A stale mount.lnk must not enter nmount or the image cleanup paths. */
+    if (stat(src_path, &source_st) != 0) {
+        return -1;
+    }
+    if (!S_ISDIR(source_st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
 
     if (find_image_in_dir(src_path, image_path, sizeof(image_path), 
                           &is_ufs, &is_pfs, &is_pfsc, &is_exfat)) {
@@ -91,10 +114,12 @@ static int mount_source(const char* src_path, char* out_mounted_path)
         if (is_ufs && mount_ufs_image(image_path, mount_point)) {
             klog_printf("UFS image mounted\n");
             strncpy(nullfs_src, mount_point, sizeof(nullfs_src)-1);
+            *out_temporary_mount = true;
         }
         else if (is_pfs && mount_pfs_image(image_path, mount_point)) {
             klog_printf("PFS image mounted\n");
             strncpy(nullfs_src, mount_point, sizeof(nullfs_src)-1);
+            *out_temporary_mount = true;
         }
         else if (is_pfsc) {
             klog_printf("PFSC image detected: %s\n", strrchr(image_path, '/') ? 
@@ -104,6 +129,7 @@ static int mount_source(const char* src_path, char* out_mounted_path)
             if (mount_pfsc_image(image_path, pfsc_mount_point)) {
                 strncpy(nullfs_src, pfsc_mount_point, sizeof(nullfs_src)-1);
                 strncpy(mount_point, pfsc_mount_point, sizeof(mount_point)-1);
+                *out_temporary_mount = true;
 
                 // === NESTED IMAGE SUPPORT ===
                 char nested_image[MAX_PATH] = {0};
@@ -143,6 +169,7 @@ static int mount_source(const char* src_path, char* out_mounted_path)
         else if (is_exfat && mount_exfat_image(image_path, mount_point)) {
             klog_printf("exFAT image mounted\n");
             strncpy(nullfs_src, mount_point, sizeof(nullfs_src)-1);
+            *out_temporary_mount = true;
         }
 
         if (strlen(nullfs_src) > 0) {
@@ -164,38 +191,66 @@ static int bind_mount_title(const char* title_id, const char* src)
 {
     char dst[PATH_MAX];
     char mounted_src[PATH_MAX] = {0};
-    struct stat st;
+    struct stat mounted_st;
+    bool temporary_mount = false;
+    bool created_dst = false;
 
     if (automount_disabled()) {
         return 0;
     }
-	
-    snprintf(dst, sizeof(dst), "/system_ex/app/%s/sce_sys", title_id);
-    if (stat(dst, &st) == 0) {
-        // Already mounted properly, skip to avoid loop interactions
+
+    snprintf(dst, sizeof(dst), "/system_ex/app/%s", title_id);
+    if (is_mounted(dst)) {
+        /* Persistent directories are not proof that nullfs is still active. */
         return 0;
     }
 
-    snprintf(dst, sizeof(dst), "/system_ex/app/%s", title_id);
-    if (unmount(dst, 0) != 0 && errno != EINVAL) {
-        klog_perror("Failed to unmount partially mounted title");
+    if (mount_source(src, mounted_src, &temporary_mount) != 0) {
+        klog_perror("Skipping title with unavailable mount.lnk source");
+        return -1;
     }
-
-    if (mkdir(dst, 0755) && errno != EEXIST) {
-        klog_perror("Failed to create mount directory for title");
+    if (stat(mounted_src, &mounted_st) != 0) {
+        klog_perror("Prepared title source is not a directory");
+        if (temporary_mount) {
+            unmount(mounted_src, MNT_FORCE);
+            rmdir(mounted_src);
+        }
+        return -1;
+    }
+    if (!S_ISDIR(mounted_st.st_mode)) {
+        errno = ENOTDIR;
+        klog_perror("Prepared title source is not a directory");
+        if (temporary_mount) {
+            unmount(mounted_src, MNT_FORCE);
+            rmdir(mounted_src);
+        }
         return -1;
     }
 
-    if (mount_source(src, mounted_src) != 0) {
-        klog_printf("Failed to prepare source, using original path\n");
-        strncpy(mounted_src, src, sizeof(mounted_src)-1);
+    if (unmount(dst, 0) != 0 && errno != EINVAL && errno != ENOENT) {
+        klog_perror("Failed to unmount partially mounted title");
+    }
+
+    if (mkdir(dst, 0755) == 0) {
+        created_dst = true;
+    } else if (errno != EEXIST) {
+        klog_perror("Failed to create mount directory for title");
+        if (temporary_mount) {
+            unmount(mounted_src, MNT_FORCE);
+            rmdir(mounted_src);
+        }
+        return -1;
     }
 
     if (mount_nullfs(mounted_src, dst) != 0) {
         klog_perror("Failed to bind mount title with mount_nullfs");
-        // Cleanup block loop mappings if nullfs fails
-        unmount_pfsc(mounted_src);
-        unmount_pfs(mounted_src);
+        /* Never unmount the mount.lnk source itself. Only a temporary image
+         * mount created above is owned by this invocation. */
+        if (temporary_mount) {
+            unmount(mounted_src, MNT_FORCE);
+            rmdir(mounted_src);
+        }
+        if (created_dst) rmdir(dst);
         return -1;
     }
 
@@ -286,6 +341,9 @@ static int monitor_usb_changes(void) {
 
     while (1) {
         if (kevent(kq, NULL, 0, &evt, 1, NULL) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             klog_perror("kevent wait failed while monitoring USB changes");
             break;
         }
@@ -360,7 +418,11 @@ int main(void) {
         }
     }
 
-    void (*entry)(payload_args_t*) = base + ehdr->e_entry;
+    void (*entry)(payload_args_t*, uint64_t,
+                  intptr_t (*)(int, uint32_t, const char*),
+                  int (*)(int, const char*, uint32_t*),
+                  kstuff_shellcore_imports_fn) =
+        base + ehdr->e_entry;
     payload_args_t* args = payload_get_args();
 
     // allow dlsym on 5.00+ - https://gist.github.com/TheOfficialFloW/7174351201b5260d7780780f4059bebf#file-exploitnetcontrolimpl-java-L851
@@ -371,7 +433,9 @@ int main(void) {
     kernel_setlong(eboot_segments + 0x08, 0); // addr
     kernel_setlong(eboot_segments + 0x10, 0xFFFFFFFFFFFFFFFFL); // size
 
-    entry(args);
+    entry(args, KSTUFF_DYNLIB_RESOLVER_MAGIC,
+          kernel_dynlib_resolve, kernel_dynlib_handle,
+          shellcore_import_got);
     if(*args->payloadout == 0) {
         puts("patching app.db");
         *args->payloadout = patch_app_db();

@@ -61,4 +61,3 @@ static struct shellcore_patch shellcore_patches_600_devkit[] = {
 
 #endif // SHELLCORE_PATCHES_6_00
 
-
